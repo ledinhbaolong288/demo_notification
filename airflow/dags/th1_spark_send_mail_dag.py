@@ -14,7 +14,6 @@ with DAG(
         task_id="run_spark_check",
         bash_command="""
         docker exec \
-          -e MOCK_STATUS=NO_DATA \
           -e SMTP_HOST=mailhog \
           -e SMTP_PORT=1025 \
           -e MAIL_FROM=airflow@local.test \

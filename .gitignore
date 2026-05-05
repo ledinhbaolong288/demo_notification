@@ -2,3 +2,6 @@
 .env
 /airflow/logs/
 /airflow/includes/
+/airflow/dags/__pycache__/
+/spark/jobs/__pycache__/
+/airflow/include/

@@ -1,137 +1,228 @@
-# Airflow + Spark Data Quality Notification Flows
+# ETL Data Quality Monitoring System
 
-## Tổng quan logic check data quality
+Dự án này triển khai hệ thống cảnh báo chất lượng dữ liệu cho Data Warehouse (DWH) sử dụng Apache Airflow để orchestrate, Apache Spark để xử lý dữ liệu, ClickHouse làm database, và Docker để containerize toàn bộ stack.
 
-### Rule nghiệp vụ
-
-1. Kiểm tra `TBL_DATA_CHECK` hôm nay có dữ liệu chưa
-
-   * không có → cảnh báo **chưa có data**
-2. Nếu có dữ liệu, lấy các record lỗi mới nhất:
-
-   * `STATUS != 'HAS_DATA'`
-3. Nếu không có record lỗi:
-
-   * kết quả **OK**
-4. Nếu có record lỗi:
-
-   * cảnh báo **data lỗi / thiếu data**
-
----
-# TH1: Airflow gọi Spark check data, Spark gửi mail
-
-## Flow
+## Kiến trúc hệ thống
 
 ```text
-Airflow schedule
-   -> trigger Spark job
-      -> Spark query DB
-      -> Spark check:
-           - chưa có data hôm nay?
-           - có data lỗi?
-      -> Spark tự gửi email
-   -> Airflow chỉ nhận trạng thái success/fail của Spark job
+Docker Compose Stack:
+├── airflow-webserver (Airflow UI + Scheduler)
+├── airflow-worker (Airflow task execution)
+├── spark-master (Spark master node)
+├── spark-worker (Spark worker node)
+├── clickhouse (OLAP database)
+├── mailhog (Email testing server)
+└── postgres (Airflow metadata DB)
 ```
 
-## DAG Airflow
+## Cấu trúc thư mục
 
+```
+.
+├── airflow/                    # Airflow configuration
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   ├── dags/                   # DAG definitions
+│   ├── include/                # Shared utilities
+│   └── logs/                   # Airflow logs
+├── spark/                      # Spark jobs
+│   ├── Dockerfile
+│   ├── conf/                   # Spark config
+│   ├── jobs/                   # PySpark scripts
+│   └── data/                   # Sample data (mounted)
+├── clickhouse/                 # ClickHouse init scripts
+├── postgres/                   # Postgres init scripts
+├── shared/                     # Shared volumes
+│   ├── checks/                 # Data quality results
+│   ├── logs/                   # Application logs
+│   └── raw/                    # Raw data storage
+├── sample_data/                # Test data files
+├── docker-compose.yml          # Docker orchestration
+└── README.md
+```
+
+## Prerequisites
+
+- Docker & Docker Compose
+- Python 3.8+ (for local development)
+- Git
+
+## Setup và Chạy
+
+1. **Clone repository:**
+   ```bash
+   git clone <repository-url>
+   cd etl_airbyte_spark_clickhouse_docker
+   ```
+
+2. **Start services:**
+   ```bash
+   docker-compose up -d
+   ```
+
+3. **Access services:**
+   - Airflow UI: http://localhost:8080 (admin/admin)
+   - Spark Master UI: http://localhost:8081
+   - MailHog UI: http://localhost:8025
+   - ClickHouse: localhost:8123
+
+4. **Stop services:**
+   ```bash
+   docker-compose down
+   ```
+
+## Logic Check Data Quality
+
+Hệ thống thực hiện 3 bước kiểm tra chất lượng dữ liệu theo requirement:
+
+### Step 1: Kiểm tra có dữ liệu kiểm tra trong ngày
+- Query `tbl_data_check` cho ngày hiện tại
+- Nếu không có record nào → Cảnh báo "Chưa có dữ liệu kiểm tra table trong ngày YYYY-MM-DD"
+
+### Step 2: Lấy latest error records per table
+- Join với `meta_table_names` để lấy danh sách tables cần monitor
+- Lọc records có `STATUS != 'HAS_DATA'`
+- Nếu không có error records → Message "Dữ liệu trong ngày đã đủ"
+
+### Step 3: Validate cron matching
+- Với mỗi error record, sử dụng `CHECK_DATE` để xác định `data_date = CHECK_DATE - 1 ngày`
+- So sánh `data_date` với `DATA_NON_EXISTS_TIME` (cron pattern)
+- Nếu `data_date` match cron → missing data tại `data_date` là bình thường (MATCH) và không alert
+- Nếu `data_date` không match cron → missing data là bất thường (UNMATCH) và alert danh sách tables
+
+## TH1: Spark tự gửi email
+
+### Flow
+```
+Airflow DAG → Spark job → Query data → Check logic → Send email directly
+```
+
+### Key Features
+- Spark xử lý toàn bộ logic check và gửi email
+- Sử dụng CSV files: `tbl_data_check.csv`, `meta_table_names.csv`
+- Cron parsing: Hỗ trợ patterns như `"* * * * 0,1"` (weekends), `"* * * * 2,3,4,5"` (weekdays)
+- Cron matching: Khi CHECK_DATE match DATA_NON_EXISTS_TIME → MATCH (không alert), ngược lại UNMATCH (alert)
+
+### Sample Code (th1_mock_check_and_send_mail.py)
 ```python
-from datetime import datetime
-from airflow import DAG
-from airflow.operators.bash import BashOperator
+# Read input CSV and parse CHECK_DATE
+df = (
+    spark.read.option("header", True)
+    .csv(TBL_DATA_CHECK_PATH)
+    .withColumn("CHECK_DATE", to_timestamp(col("CHECK_DATE"), "yyyy-MM-dd HH:mm:ss"))
+)
 
-with DAG(
-    dag_id="th1_spark_send_mail_dag",
-    start_date=datetime(2026, 4, 1),
-    schedule=None,
-    catchup=False,
-    tags=["spark", "mail", "th1"],
-) as dag:
-
-    run_spark_check = BashOperator(
-        task_id="run_spark_check",
-        bash_command="""
-        docker exec \
-          -e MOCK_STATUS=NO_DATA \
-          -e SMTP_HOST=mailhog \
-          -e SMTP_PORT=1025 \
-          -e MAIL_FROM=airflow@local.test \
-          -e MAIL_TO=data-team@example.com \
-          spark-master \
-          /opt/spark/bin/spark-submit \
-          --master spark://spark-master:7077 \
-          /opt/spark/jobs/th1_mock_check_and_send_mail.py
-        """
+# Join with metadata to get DATA_NON_EXISTS_TIME from meta if present
+df = (
+    df.join(meta_df, df.TBL_NAME == meta_df.meta_full_tbl_schema_name, "inner")
+    .withColumn(
+        "DATA_NON_EXISTS_TIME",
+        coalesce(meta_df.meta_data_non_exists_time, col("DATA_NON_EXISTS_TIME")),
     )
+)
+
+# Filter records only for today
+df_today = df.filter((col("CHECK_DATE") >= start_of_today) & (col("CHECK_DATE") < start_of_next_day))
+
+# If no rows today, send missing-data alert only when not weekend
+if df_today.count() == 0:
+    if not is_weekend:
+        send_mail(
+            f"[DWH_ALERT][TH1] Chưa có dữ liệu kiểm tra table trong ngày {format_date(today)}",
+            f"TH1: Spark phát hiện chưa có dữ liệu kiểm tra table trong ngày {format_date(today)}."
+        )
+    return
+
+# Select latest error row per table
+error_window = Window.partitionBy("TBL_NAME").orderBy(desc("CHECK_DATE"))
+df_errors = (
+    df_today.filter(col("STATUS") != "HAS_DATA")
+    .withColumn("row_num", row_number().over(error_window))
+    .filter(col("row_num") == 1)
+)
+
+# Separate NO_DATA and ERROR_DATA, then compare with cron schedule
+unmatch_no_data = process_rows(no_data_rows, "NO_DATA")
+unmatch_error_data = process_rows(error_data_rows, "ERROR_DATA")
+
+if unmatch_no_data or unmatch_error_data:
+    send_mail(subject, body)
+```
+## TH2: Spark ghi kết quả, Airflow gửi email
+
+### Flow
+```
+Airflow DAG → Spark job → Query data → Check logic → Write JSON result → Airflow read JSON → Send email
 ```
 
-## Spark job: `th1_mock_check_and_send_mail.py`
+### Key Features
+- Spark chỉ xử lý data và ghi kết quả JSON
+- Airflow chịu trách nhiệm gửi email dựa trên status
+- Conditional branching: NO_DATA → send alert, ERROR_DATA → prepare email, OK → finish
+- Dynamic subject extraction từ Spark message
+- Special handling cho "no records" case
+- Cron matching: Khi CHECK_DATE match DATA_NON_EXISTS_TIME → MATCH (không alert), ngược lại UNMATCH (alert)
 
+### Sample DAG (th2_airflow_send_mail_dag.py)
 ```python
-import os
-import smtplib
-from email.mime.text import MIMEText
-from pyspark.sql import SparkSession
+def branch_result(**context):
+    with open(RESULT_FILE, "r", encoding="utf-8") as f:
+        result = json.load(f)
 
-spark = SparkSession.builder.appName("th1-mock-check-send-mail").getOrCreate()
+    context["ti"].xcom_push(key="dq_result", value=result)
+    if result.get("no_data_tables") or result.get("error_data_tables"):
+        return "prepare_combined_email"
+    return "finish_ok"
 
-MOCK_STATUS = os.getenv("MOCK_STATUS", "OK")  # OK | NO_DATA | ERROR_DATA
-SMTP_HOST = os.getenv("SMTP_HOST", "mailhog")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "1025"))
-MAIL_FROM = os.getenv("MAIL_FROM", "airflow@local.test")
-MAIL_TO = os.getenv("MAIL_TO", "data-team@example.com")
 
-def send_mail(subject: str, body: str):
-    msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"] = subject
-    msg["From"] = MAIL_FROM
-    msg["To"] = MAIL_TO
-
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-        server.sendmail(MAIL_FROM, [MAIL_TO], msg.as_string())
-
-print(f"MOCK_STATUS = {MOCK_STATUS}")
-
-if MOCK_STATUS == "NO_DATA":
-    send_mail(
-        "[DWH_ALERT][TH1] Chưa có data",
-        "TH1: Spark phát hiện chưa có dữ liệu và tự gửi mail."
+def prepare_combined_email(**context):
+    result = context["ti"].xcom_pull(task_ids="branch_after_spark", key="dq_result")
+    is_no_records = (
+        result.get("no_data_tables")
+        and len(result.get("no_data_tables", [])) == 1
+        and "No data quality check records found" in result.get("no_data_tables", [])[0]
     )
-    print("Sent NO_DATA email from Spark")
 
-elif MOCK_STATUS == "ERROR_DATA":
-    send_mail(
-        "[DWH_ALERT][TH1] Data lỗi",
-        "TH1: Spark phát hiện dữ liệu lỗi hoặc thiếu dữ liệu và tự gửi mail."
-    )
-    print("Sent ERROR_DATA email from Spark")
+    # Extract date from message for subject
+    message = result.get("message", "")
+    date_match = re.search(r"(\d{4}-\d{2}-\d{2})", message)
+    today = date_match.group(1) if date_match else datetime.now().strftime("%Y-%m-%d")
 
-else:
-    print("TH1: Data OK - no email sent")
+    if is_no_records:
+        subject = f"[DWH_ALERT][TH2] Chưa có dữ liệu kiểm tra table trong ngày {today}"
+        html = f"<h1>{message}</h1>"
+    else:
+        subject = f"[DWH_ALERT][TH2] Data Quality Alert [{today}]"
+        sections = []
+        if result.get("no_data_tables"):
+            sections.append(
+                "<h2>Status = NO_DATA</h2>"
+                + "<p>Danh sách bảng thiếu dữ liệu:</p><ul>"
+                + "".join(f"<li>{t}</li>" for t in result["no_data_tables"])
+                + "</ul>"
+            )
+        if result.get("error_data_tables"):
+            sections.append(
+                "<h2>Status = ERROR_DATA</h2>"
+                + "<p>Danh sách bảng có dữ liệu lỗi:</p><ul>"
+                + "".join(f"<li>{t}</li>" for t in result["error_data_tables"])
+                + "</ul>"
+            )
+        html = f"<h1>{message}</h1>" + "".join(sections)
 
-spark.stop()
-```
+    context["ti"].xcom_push(key="combined_email_subject", value=subject)
+    context["ti"].xcom_push(key="combined_email_body", value=html)
 
----
-
-# TH2: Airflow gọi Spark check data, Airflow gửi mail
-
-## Flow
-
-```text
-Airflow schedule
-   -> trigger Spark job
-      -> Spark query DB
-      -> Spark check data quality
-      -> Spark ghi result.json
-   -> Airflow đọc result.json
-   -> Airflow gửi mail theo status
+run_spark_check >> branch_after_spark
+branch_after_spark >> prepare_combined_email_task >> send_combined_email
+branch_after_spark >> finish_ok
 ```
 
 ## DAG Airflow
 
 ```python
 import json
+import re
 from datetime import datetime
 from airflow import DAG
 from airflow.operators.bash import BashOperator
@@ -146,22 +237,46 @@ def branch_result(**context):
         result = json.load(f)
 
     context["ti"].xcom_push(key="dq_result", value=result)
-
-    if result["status"] == "NO_DATA":
-        return "send_no_data_email"
-    elif result["status"] == "ERROR_DATA":
-        return "prepare_error_email"
+    if result.get("no_data_tables") or result.get("error_data_tables"):
+        return "prepare_combined_email"
     return "finish_ok"
 
-def prepare_error_email(**context):
+
+def prepare_combined_email(**context):
     result = context["ti"].xcom_pull(task_ids="branch_after_spark", key="dq_result")
-    html = (
-        f"<h3>{result['message']}</h3>"
-        + "<p>Các bảng lỗi:</p><ul>"
-        + "".join(f"<li>{t}</li>" for t in result.get("tables", []))
-        + "</ul>"
+    is_no_records = (
+        result.get("no_data_tables")
+        and len(result.get("no_data_tables", [])) == 1
+        and "No data quality check records found" in result.get("no_data_tables", [])[0]
     )
-    context["ti"].xcom_push(key="error_email_body", value=html)
+    message = result.get("message", "")
+    date_match = re.search(r"(\d{4}-\d{2}-\d{2})", message)
+    today = date_match.group(1) if date_match else datetime.now().strftime("%Y-%m-%d")
+
+    if is_no_records:
+        subject = f"[DWH_ALERT][TH2] Chưa có dữ liệu kiểm tra table trong ngày {today}"
+        html = f"<h1>{message}</h1>"
+    else:
+        subject = f"[DWH_ALERT][TH2] Data Quality Alert [{today}]"
+        sections = []
+        if result.get("no_data_tables"):
+            sections.append(
+                "<h2>Status = NO_DATA</h2>"
+                + "<p>Danh sách bảng thiếu dữ liệu:</p><ul>"
+                + "".join(f"<li>{t}</li>" for t in result["no_data_tables"])
+                + "</ul>"
+            )
+        if result.get("error_data_tables"):
+            sections.append(
+                "<h2>Status = ERROR_DATA</h2>"
+                + "<p>Danh sách bảng có dữ liệu lỗi:</p><ul>"
+                + "".join(f"<li>{t}</li>" for t in result["error_data_tables"])
+                + "</ul>"
+            )
+        html = f"<h1>{message}</h1>" + "".join(sections)
+
+    context["ti"].xcom_push(key="combined_email_subject", value=subject)
+    context["ti"].xcom_push(key="combined_email_body", value=html)
 
 with DAG(
     dag_id="th2_airflow_send_mail_dag",
@@ -175,7 +290,6 @@ with DAG(
         task_id="run_spark_check",
         bash_command="""
         docker exec \
-          -e MOCK_STATUS=ERROR_DATA \
           -e OUTPUT_FILE=/opt/spark/shared/dq/result.json \
           spark-master \
           /opt/spark/bin/spark-submit \
@@ -189,30 +303,22 @@ with DAG(
         python_callable=branch_result
     )
 
-    prepare_error_email_task = PythonOperator(
-        task_id="prepare_error_email",
-        python_callable=prepare_error_email
+    prepare_combined_email_task = PythonOperator(
+        task_id="prepare_combined_email",
+        python_callable=prepare_combined_email
     )
 
-    send_no_data_email = EmailOperator(
-        task_id="send_no_data_email",
+    send_combined_email = EmailOperator(
+        task_id="send_combined_email",
         to="data-team@example.com",
-        subject="[DWH_ALERT][TH2] Chưa có data",
-        html_content="<p>TH2: Airflow nhận kết quả từ Spark và gửi mail cảnh báo chưa có data.</p>"
-    )
-
-    send_error_data_email = EmailOperator(
-        task_id="send_error_data_email",
-        to="data-team@example.com",
-        subject="[DWH_ALERT][TH2] Data lỗi",
-        html_content="{{ ti.xcom_pull(task_ids='prepare_error_email', key='error_email_body') }}"
+        subject="{{ ti.xcom_pull(task_ids='prepare_combined_email', key='combined_email_subject') }}",
+        html_content="{{ ti.xcom_pull(task_ids='prepare_combined_email', key='combined_email_body') }}"
     )
 
     finish_ok = EmptyOperator(task_id="finish_ok")
 
     run_spark_check >> branch_after_spark
-    branch_after_spark >> send_no_data_email
-    branch_after_spark >> prepare_error_email_task >> send_error_data_email
+    branch_after_spark >> prepare_combined_email_task >> send_combined_email
     branch_after_spark >> finish_ok
 ```
 
@@ -221,38 +327,68 @@ with DAG(
 ```python
 import os
 import json
+from datetime import datetime, time, timedelta
 from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, coalesce, desc, row_number, to_timestamp
+from pyspark.sql.window import Window
 
 spark = SparkSession.builder.appName("th2-mock-check-write-result").getOrCreate()
-
-MOCK_STATUS = os.getenv("MOCK_STATUS", "OK")  # OK | NO_DATA | ERROR_DATA
 OUTPUT_FILE = os.getenv("OUTPUT_FILE", "/opt/spark/shared/dq/result.json")
 
-if MOCK_STATUS == "NO_DATA":
+# Read input CSV and parse CHECK_DATE
+df = (
+    spark.read.option("header", True)
+    .csv(TBL_DATA_CHECK_PATH)
+    .withColumn("CHECK_DATE", to_timestamp(col("CHECK_DATE"), "yyyy-MM-dd HH:mm:ss"))
+)
+
+# Join with metadata and prefer meta DATA_NON_EXISTS_TIME
+df = (
+    df.join(meta_df, df.TBL_NAME == meta_df.meta_full_tbl_schema_name, "inner")
+    .withColumn(
+        "DATA_NON_EXISTS_TIME",
+        coalesce(meta_df.meta_data_non_exists_time, col("DATA_NON_EXISTS_TIME")),
+    )
+)
+
+# Filter today's data
+df_today = df.filter((col("CHECK_DATE") >= start_of_today) & (col("CHECK_DATE") < start_of_next_day))
+
+if df_today.count() == 0:
     result = {
         "status": "NO_DATA",
-        "message": "TH2: Không có dữ liệu trong ngày hôm nay.",
-        "tables": []
+        "message": f"Spark phát hiện chưa có dữ liệu kiểm tra table trong ngày {format_date(today)}",
+        "no_data_tables": [f"No data quality check records found for {format_date(today)}"],
+        "error_data_tables": [],
     }
-elif MOCK_STATUS == "ERROR_DATA":
-    result = {
-        "status": "ERROR_DATA",
-        "message": "TH2: Phát hiện dữ liệu lỗi.",
-        "tables": ["orders", "customers"]
-    }
-else:
-    result = {
-        "status": "OK",
-        "message": "TH2: Dữ liệu bình thường.",
-        "tables": []
-    }
+    write_result(result)
+    spark.stop()
+    return
 
-os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
-with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-    json.dump(result, f, ensure_ascii=False, indent=2)
+# Latest non-HAS_DATA row per table
+error_window = Window.partitionBy("TBL_NAME").orderBy(desc("CHECK_DATE"))
+df_errors = (
+    df_today.filter(col("STATUS") != "HAS_DATA")
+    .withColumn("row_num", row_number().over(error_window))
+    .filter(col("row_num") == 1)
+)
 
-print(f"Written result: {result}")
+# Compare rows against cron schedule
+unmatch_no_data = process_rows(no_data_rows)
+unmatch_error_data = process_rows(error_data_rows)
+
+status = "ERROR_DATA" if unmatch_error_data else "NO_DATA" if unmatch_no_data else "OK"
+result = {
+    "status": status,
+    "message": f"TH2: Spark phát hiện vấn đề dữ liệu trong ngày {format_date(today)}",
+    "no_data_tables": unmatch_no_data,
+    "error_data_tables": unmatch_error_data,
+    "timestamp": datetime.now().isoformat(),
+}
+write_result(result)
 spark.stop()
+![alt text](image-1.png)
+![alt text](image-2.png)
 ```
 ![alt text](image.png)
 ---

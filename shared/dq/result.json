@@ -1,0 +1,12 @@
+{
+  "status": "ERROR_DATA",
+  "message": "TH2: Spark phát hiện vấn đề dữ liệu trong ngày 2026-05-04",
+  "no_data_tables": [
+    "DAB2HDB.MV_FCC_CUSTOMER",
+    "DAB2HDB.MV_FCC_CUSTOMER_TEST"
+  ],
+  "error_data_tables": [
+    "DAB2HDB.FCC_ACCOUNT_TRANSACTION_LISTING"
+  ],
+  "timestamp": "2026-05-05T07:59:54.632932"
+}
