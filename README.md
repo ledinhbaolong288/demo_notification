@@ -1,5 +1,7 @@
 # ETL Data Quality Monitoring System
 
+**Phiên bản:** Final
+
 Dự án này triển khai hệ thống cảnh báo chất lượng dữ liệu cho Data Warehouse (DWH) sử dụng Apache Airflow để orchestrate, Apache Spark để xử lý dữ liệu, ClickHouse làm database, và Docker để containerize toàn bộ stack.
 
 ## Kiến trúc hệ thống

@@ -62,7 +62,7 @@ def format_date(dt: datetime) -> str:
 
 
 def main():
-    today = datetime.now().date() - timedelta(days=4)
+    today = datetime.now().date() #- timedelta(days=5)
     start_of_today = datetime.combine(today, time.min)
     start_of_next_day = start_of_today + timedelta(days=1)
     print("today:", today)

@@ -57,7 +57,7 @@ def write_result(result):
 
 
 def main():
-    today = datetime.now().date() - timedelta(days=1)
+    today = datetime.now().date() #- timedelta(days=5)
     start_of_today = datetime.combine(today, time.min)
     start_of_next_day = start_of_today + timedelta(days=1)
     print("start_of_today:", start_of_today)
